@@ -36,5 +36,5 @@ docker build -t YOUR_DOCKER_IMAGE_NAME .
 
 ```bash
 # this command can be scheduled in cron
-docker run -it --rm -v $(pwd)/.env:/app/.env -v $(pwd)/.env:/app/.env -w /app YOUR_DOCKER_IMAGE_NAME python sync.py
+docker run -it --rm -v $(pwd)/.env:/app/.env -w /app YOUR_DOCKER_IMAGE_NAME python sync.py
 ```
