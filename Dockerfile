@@ -4,11 +4,19 @@ FROM python:3.12-slim
 # Set the working directory in the container
 WORKDIR /app
 
-# Copy the Pipfile and Pipfile.lock to the container
-COPY Pipfile Pipfile.lock ./
+# Add the Pipfile and Pipfile.lock into the container at /app
+COPY Pipfile ./Pipfile
+COPY Pipfile.lock ./Pipfile.lock
 
-# Install pipenv and project dependencies
-RUN pip install pipenv && pipenv install --deploy --ignore-pipfile
+# Set up and activate a virtual environment
+RUN python -m venv ./venv
+ENV PATH="/app/venv/bin:$PATH"
+
+# Install pipenv
+RUN pip install pipenv
+
+# Install any needed packages specified in Pipfile
+RUN python -m pipenv install --system --deploy
 
 # Copy the rest of the application code to the container
 COPY . .
