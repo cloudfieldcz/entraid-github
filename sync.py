@@ -476,12 +476,12 @@ async def sync():
     gh_users_to_add = [user for user in aad_gh_users if user not in gh_users]
     print('GH users to remove:', gh_users_to_delete)
     # deleting users from github
-    #for user in gh_users_to_delete:
-    #    gh.remove_user(user)
+    for user in gh_users_to_delete:
+        gh.remove_user(user)
     print('GH users to add:', gh_users_to_add)
     # inviting users to github
-    #for user in gh_users_to_add:
-    #    gh.invite_user(user)
+    for user in gh_users_to_add:
+        gh.invite_user(user)
     
     # teams
     gh_teams = gh.list_teams()
@@ -512,14 +512,14 @@ async def sync():
         users_to_add = [user for user in aad_gh_group_members if user not in gh_team_members]
         print(f'Users to add to GH team {gh_team_slug}:', users_to_add)
         # add users to team
-        #for user in users_to_add:
-        #    gh.add_user_to_team(gh_team_slug, user)
+        for user in users_to_add:
+            gh.add_user_to_team(gh_team_slug, user)
         # users to remove
         users_to_remove = [user for user in gh_team_members if user not in aad_gh_group_members]
         print(f'Users to remove from GH team {gh_team_slug}:', users_to_remove)
         # remove users from team
-        #for user in users_to_remove:
-        #    gh.remove_user_from_team(gh_team_slug, user)
+        for user in users_to_remove:
+            gh.remove_user_from_team(gh_team_slug, user)
 
 
 asyncio.run(sync())
