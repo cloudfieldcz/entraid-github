@@ -9,7 +9,8 @@ from dotenv import load_dotenv
 import logging
 
 # log format with timestamp 
-logging.basicConfig(format='%(asctime)s - %(message)s')
+LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
+logging.basicConfig(format='%(asctime)s - %(message)s', level=LOGLEVEL)
 
 # Load environment variables from a .env file
 load_dotenv()
