@@ -10,7 +10,15 @@ import logging
 
 # log format with timestamp 
 LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
-logging.basicConfig(format='%(asctime)s - %(message)s', level=LOGLEVEL)
+logging.basicConfig(format='%(asctime)s - %(levelname)s - %(message)s', level=LOGLEVEL)
+
+# Suppress logging for specific modules
+logging.getLogger('azure.identity').setLevel(logging.WARNING)
+logging.getLogger('msgraph').setLevel(logging.WARNING)
+logging.getLogger('msgraph.generated.groups').setLevel(logging.WARNING)
+# Suppress HTTP request/response logs
+logging.getLogger('azure.core.pipeline.policies.http_logging_policy').setLevel(logging.WARNING)
+logging.getLogger('azure.identity.aio').setLevel(logging.WARNING)
 
 # Load environment variables from a .env file
 load_dotenv()
@@ -475,14 +483,14 @@ async def sync():
         gh_users = gh.list_users()
     except Exception as e:
         error_log.append(f'Error listing GitHub users: {e}')
-    logging.info('GH users:', gh_users)    
+    logging.info('GH users: %s', gh_users)    
     
     aad_users = []
     try:
         aad_users = await aad.get_group_members(gh_all_group)
     except Exception as e:
         error_log.append(f'Error listing AAD users: {e}')
-    logging.info('AAD users:', aad_users)
+    logging.info('AAD users: %s', aad_users)
     
     # gh users or aad users are empty, raise an error and skip the rest of the script
     if not gh_users or not aad_users:
@@ -490,11 +498,11 @@ async def sync():
         return error_log
         
     aad_gh_users = [user['github_username'] for user in aad_users]
-    logging.info('AAD GH users:', aad_gh_users)
+    logging.info('AAD GH users: %s', aad_gh_users)
 
     gh_users_to_delete = [user for user in gh_users if user not in aad_gh_users]
     gh_users_to_add = [user for user in aad_gh_users if user not in gh_users]
-    logging.info('GH users to remove:', gh_users_to_delete)
+    logging.info('GH users to remove: %s', gh_users_to_delete)
     
     # deleting users from github
     for user in gh_users_to_delete:
@@ -503,7 +511,7 @@ async def sync():
         except Exception as e:
             error_log.append(f'Error removing user {user} from GitHub: {e}')
             
-    logging.info('GH users to add:', gh_users_to_add)
+    logging.info('GH users to add: %s', gh_users_to_add)
     # inviting users to github
     for user in gh_users_to_add:
         try:
@@ -517,7 +525,7 @@ async def sync():
     except Exception as e:
         error_log.append(f'Error listing GitHub teams: {e}')
         return error_log
-    logging.info('GH teams:', gh_teams)
+    logging.info('GH teams: %s', gh_teams)
 
     # process AAD groups
     try:
@@ -525,7 +533,7 @@ async def sync():
     except Exception as e:
         error_log.append(f'Error listing AAD groups: {e}')
         return error_log
-    logging.info('AAD GH groups:', aad_gh_groups)
+    logging.info('AAD GH groups: %s', aad_gh_groups)
 
     for tmp_group in aad_gh_groups:
         group_id = tmp_group['id']
@@ -535,7 +543,7 @@ async def sync():
             tmp_aad_gh_group_members = [user['github_username'] for user in aad_group_members]
             # filter out users that are not in aad_gh_users
             aad_gh_group_members = [user for user in tmp_aad_gh_group_members if user in aad_gh_users]
-            logging.info(f'AAD GH group {tmp_group["display_name"]} members:', aad_gh_group_members)
+            logging.info(f'AAD GH group {tmp_group["display_name"]} members: %s', aad_gh_group_members)
             # gh team members
             gh_team_slug = remove_prefix(tmp_group["display_name"], gh_prefix)
             # check if team in gh_teams exists, if not, create it
@@ -544,10 +552,10 @@ async def sync():
                 gh.create_team(gh_team_slug)
             # get members of the team        
             gh_team_members = gh.get_team_members(gh_team_slug)
-            logging.info(f'GH team {gh_team_slug} members:', gh_team_members)
+            logging.info(f'GH team {gh_team_slug} members: %s', gh_team_members)
             # users to add
             users_to_add = [user for user in aad_gh_group_members if user not in gh_team_members]
-            logging.info(f'Users to add to GH team {gh_team_slug}:', users_to_add)
+            logging.info(f'Users to add to GH team {gh_team_slug}: %s', users_to_add)
             # add users to team
             for user in users_to_add:
                 try:
@@ -556,7 +564,7 @@ async def sync():
                     error_log.append(f'Error adding user {user} to GH team {gh_team_slug}: {e}')
             # users to remove
             users_to_remove = [user for user in gh_team_members if user not in aad_gh_group_members]
-            logging.info(f'Users to remove from GH team {gh_team_slug}:', users_to_remove)
+            logging.info(f'Users to remove from GH team {gh_team_slug}: %s', users_to_remove)
             # remove users from team
             for user in users_to_remove:
                 try:
@@ -576,7 +584,7 @@ def send_email(errors):
         "subject": "GITHUB Sync errors",
         "body": body
     }
-    logging.warn(f"Sending email with errors to {data['recipient']}")
+    logging.warning(f"Sending email with errors to {data['recipient']}")
     response = requests.post(url, json=data)
 
 async def main():
