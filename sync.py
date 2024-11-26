@@ -6,9 +6,13 @@ from azure.identity.aio import ClientSecretCredential
 from msgraph import GraphServiceClient
 from msgraph.generated.groups.groups_request_builder import GroupsRequestBuilder
 from dotenv import load_dotenv
+import logging
 
-# pip install azure-identity msgraph-core
-# pip install msgraph-sdk azure-identity
+# log format with timestamp 
+logging.basicConfig(format='%(asctime)s - %(message)s')
+
+# Load environment variables from a .env file
+load_dotenv()
 
 class AzureADGroupMembers:
     def __init__(self, tenant_id: str, client_id: str, client_secret: str):
@@ -107,7 +111,7 @@ class AzureADGroupMembers:
                 group_id = response.value[0].id
                 return await self.list_group_members_by_id(group_id)
         else:
-            print(f"No group found with the name '{group_name}'")
+            logging.debug(f"No group found with the name '{group_name}'")
             return None
 
     async def list_groups(self, group_name_prefix:str):
@@ -209,7 +213,7 @@ class GitHubOrgManager:
         data = {'invitee_id': self.get_user_id(username)}
         response = requests.post(url, headers=self.headers, json=data)
         if response.status_code == 201:
-            print(f'Invitation sent to {username}.')
+            logging.debug(f'Invitation sent to {username}.')
         else:
             raise Exception(f'Error inviting user: {response.status_code} - {response.text}')
 
@@ -222,7 +226,7 @@ class GitHubOrgManager:
         url = f'{self.base_url}/members/{username}'
         response = requests.delete(url, headers=self.headers)
         if response.status_code == 204:
-            print(f'{username} removed from the organization.')
+            logging.debug(f'{username} removed from the organization.')
         else:
             raise Exception(f'Error removing user: {response.status_code} - {response.text}')
 
@@ -261,7 +265,7 @@ class GitHubOrgManager:
         data = {'name': team_name}
         response = requests.post(url, headers=self.headers, json=data)
         if response.status_code == 201:
-            print(f'Team {team_name} created.')
+            logging.debug(f'Team {team_name} created.')
         else:
             raise Exception(f'Error creating team: {response.status_code} - {response.text}')
 
@@ -301,7 +305,7 @@ class GitHubOrgManager:
         url = f'{self.base_url}/teams/{team_slug}/memberships/{username}'
         response = requests.put(url, headers=self.headers)
         if response.status_code == 200:
-            print(f'{username} added to team {team_slug}.')
+            logging.debug(f'{username} added to team {team_slug}.')
         else:
             raise Exception(f'Error adding user to team: {response.status_code} - {response.text}')
 
@@ -315,7 +319,7 @@ class GitHubOrgManager:
         url = f'{self.base_url}/teams/{team_slug}/memberships/{username}'
         response = requests.delete(url, headers=self.headers)
         if response.status_code == 204:
-            print(f'{username} removed from team {team_slug}.')
+            logging.debug(f'{username} removed from team {team_slug}.')
         else:
             raise Exception(f'Error removing user from team: {response.status_code} - {response.text}')
 
@@ -400,7 +404,7 @@ class GitHubOrgManager:
         url = f'{self.base_url}/copilot/billing/selected_users/{username}'
         response = requests.put(url, headers=self.headers)
         if response.status_code == 204:
-            print(f'Copilot seat assigned to {username}.')
+            logging.debug(f'Copilot seat assigned to {username}.')
         else:
             raise Exception(f'Error assigning Copilot seat: {response.status_code} - {response.text}')
 
@@ -413,7 +417,7 @@ class GitHubOrgManager:
         url = f'{self.base_url}/copilot/billing/selected_users/{username}'
         response = requests.delete(url, headers=self.headers)
         if response.status_code == 204:
-            print(f'Copilot seat unassigned from {username}.')
+            logging.debug(f'Copilot seat unassigned from {username}.')
         else:
             raise Exception(f'Error unassigning Copilot seat: {response.status_code} - {response.text}')
 
@@ -451,13 +455,12 @@ def remove_prefix(text, prefix):
     return text
 
 async def sync():
-    print("SYNC")
+    logging.info("SYNC")
 
     gh_prefix = 'github_'  # prefix for AAD groups
     gh_all_group = f'{gh_prefix}all'  # name of the group with all users
-
-    # Load environment variables from a .env file
-    load_dotenv()
+    
+    error_log = []
     
     gh = GitHubOrgManager(os.getenv('GITHUB_TOKEN'), os.getenv('GITHUB_ORG'))
     aad = AzureADGroupMembers(
@@ -466,60 +469,123 @@ async def sync():
         client_secret=os.getenv('AZURE_CLIENT_SECRET'),
     )
 
-    gh_users = gh.list_users()
-    aad_users = await aad.get_group_members(gh_all_group)
+    gh_users = []
+    try:
+        gh_users = gh.list_users()
+    except Exception as e:
+        error_log.append(f'Error listing GitHub users: {e}')
+    logging.info('GH users:', gh_users)    
+    
+    aad_users = []
+    try:
+        aad_users = await aad.get_group_members(gh_all_group)
+    except Exception as e:
+        error_log.append(f'Error listing AAD users: {e}')
+    logging.info('AAD users:', aad_users)
+    
+    # gh users or aad users are empty, raise an error and skip the rest of the script
+    if not gh_users or not aad_users:
+        error_log.append('No users found in GitHub or Azure AD.')
+        return error_log
+        
     aad_gh_users = [user['github_username'] for user in aad_users]
-    print('GH users:', gh_users)
-    print('AAD users:', aad_gh_users)
+    logging.info('AAD GH users:', aad_gh_users)
 
     gh_users_to_delete = [user for user in gh_users if user not in aad_gh_users]
     gh_users_to_add = [user for user in aad_gh_users if user not in gh_users]
-    print('GH users to remove:', gh_users_to_delete)
+    logging.info('GH users to remove:', gh_users_to_delete)
+    
     # deleting users from github
     for user in gh_users_to_delete:
-        gh.remove_user(user)
-    print('GH users to add:', gh_users_to_add)
+        try:
+            gh.remove_user(user)
+        except Exception as e:
+            error_log.append(f'Error removing user {user} from GitHub: {e}')
+            
+    logging.info('GH users to add:', gh_users_to_add)
     # inviting users to github
     for user in gh_users_to_add:
-        gh.invite_user(user)
+        try:
+            gh.invite_user(user)
+        except Exception as e:
+            error_log.append(f'Error inviting user {user} to GitHub: {e}')
     
     # teams
-    gh_teams = gh.list_teams()
-    print('GH teams:', gh_teams)
+    try:
+        gh_teams = gh.list_teams()
+    except Exception as e:
+        error_log.append(f'Error listing GitHub teams: {e}')
+        return error_log
+    logging.info('GH teams:', gh_teams)
 
     # process AAD groups
-    aad_gh_groups = await aad.list_groups(gh_prefix)
-    print('AAD GH groups:', aad_gh_groups)
+    try:
+        aad_gh_groups = await aad.list_groups(gh_prefix)
+    except Exception as e:
+        error_log.append(f'Error listing AAD groups: {e}')
+        return error_log
+    logging.info('AAD GH groups:', aad_gh_groups)
 
     for tmp_group in aad_gh_groups:
         group_id = tmp_group['id']
         # aad group members
-        aad_group_members = await aad.list_group_members_by_id(group_id)
-        tmp_aad_gh_group_members = [user['github_username'] for user in aad_group_members]
-        # filter out users that are not in aad_gh_users
-        aad_gh_group_members = [user for user in tmp_aad_gh_group_members if user in aad_gh_users]
-        print(f'AAD GH group {tmp_group["display_name"]} members:', aad_gh_group_members)
-        # gh team members
-        gh_team_slug = remove_prefix(tmp_group["display_name"], gh_prefix)
-        # check if team in gh_teams exists, if not, create it
-        if gh_team_slug.lower() not in [team.lower() for team in gh_teams]:
-            print(f'GH team {gh_team_slug} does not exist, creating it...')
-            gh.create_team(gh_team_slug)
-        # get members of the team        
-        gh_team_members = gh.get_team_members(gh_team_slug)
-        print(f'GH team {gh_team_slug} members:', gh_team_members)
-        # users to add
-        users_to_add = [user for user in aad_gh_group_members if user not in gh_team_members]
-        print(f'Users to add to GH team {gh_team_slug}:', users_to_add)
-        # add users to team
-        for user in users_to_add:
-            gh.add_user_to_team(gh_team_slug, user)
-        # users to remove
-        users_to_remove = [user for user in gh_team_members if user not in aad_gh_group_members]
-        print(f'Users to remove from GH team {gh_team_slug}:', users_to_remove)
-        # remove users from team
-        for user in users_to_remove:
-            gh.remove_user_from_team(gh_team_slug, user)
+        try:
+            aad_group_members = await aad.list_group_members_by_id(group_id)
+            tmp_aad_gh_group_members = [user['github_username'] for user in aad_group_members]
+            # filter out users that are not in aad_gh_users
+            aad_gh_group_members = [user for user in tmp_aad_gh_group_members if user in aad_gh_users]
+            logging.info(f'AAD GH group {tmp_group["display_name"]} members:', aad_gh_group_members)
+            # gh team members
+            gh_team_slug = remove_prefix(tmp_group["display_name"], gh_prefix)
+            # check if team in gh_teams exists, if not, create it
+            if gh_team_slug.lower() not in [team.lower() for team in gh_teams]:
+                logging.info(f'GH team {gh_team_slug} does not exist, creating it...')
+                gh.create_team(gh_team_slug)
+            # get members of the team        
+            gh_team_members = gh.get_team_members(gh_team_slug)
+            logging.info(f'GH team {gh_team_slug} members:', gh_team_members)
+            # users to add
+            users_to_add = [user for user in aad_gh_group_members if user not in gh_team_members]
+            logging.info(f'Users to add to GH team {gh_team_slug}:', users_to_add)
+            # add users to team
+            for user in users_to_add:
+                try:
+                    gh.add_user_to_team(gh_team_slug, user)
+                except Exception as e:
+                    error_log.append(f'Error adding user {user} to GH team {gh_team_slug}: {e}')
+            # users to remove
+            users_to_remove = [user for user in gh_team_members if user not in aad_gh_group_members]
+            logging.info(f'Users to remove from GH team {gh_team_slug}:', users_to_remove)
+            # remove users from team
+            for user in users_to_remove:
+                try:
+                    gh.remove_user_from_team(gh_team_slug, user)
+                except Exception as e:
+                    error_log.append(f'Error removing user {user} from GH team {gh_team_slug}: {e}')
+        except Exception as e:
+            error_log.append(f'Error processing AAD group {tmp_group["display_name"]}: {e}')
+            
+def send_email(errors):
+    url = os.getenv('ALERT_EMAIL_URL')
+    body = "<h3>Errors:</h3>"
+    for err in errors:
+        body += f"<p>{err}</p>"
+    data = {
+        "recipient": os.getenv('ALERT_EMAIL_RECIPIENT'),
+        "subject": "GITHUB Sync errors",
+        "body": body
+    }
+    logging.warn(f"Sending email with errors to {data['recipient']}")
+    response = requests.post(url, json=data)
 
+async def main():
+    err_log = await sync()
+    if err_log:
+        logging.error('Errors:')
+        for err in err_log:
+            logging.error(err)
+        send_email(err_log)
+    else:
+        logging.info('Sync completed successfully.')
 
-asyncio.run(sync())
+asyncio.run(main())

@@ -24,6 +24,9 @@ GITHUB_ORG=your_github_org # Github organization name
 AZURE_TENANT_ID=your_azure_tenant_id # Entra ID tenant ID
 AZURE_CLIENT_ID=your_azure_client_id # Entra ID application client ID
 AZURE_CLIENT_SECRET=your_azure_client_secret # Entra ID application secret
+
+ALERT_EMAIL_URL=your_alert_email_url # URL for sending alerts
+ALERT_EMAIL_RECIPIENT=your_alert_email_recipient # Email for sending alerts
 ```
 
 ## How to build
