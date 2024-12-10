@@ -87,6 +87,8 @@ ALERT_EMAIL_RECIPIENT=your_alert_email_recipient # Email recipient for alerts
 2. **Email Recipient**:
     - Set the email recipient for alerts in the `.env` file.
 
+---
+
 ## Building the Docker Image
 
 Build the Docker image:
