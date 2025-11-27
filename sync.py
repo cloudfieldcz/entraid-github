@@ -130,6 +130,7 @@ class AzureADGroupMembers:
                 'github_username': member.postal_code,
             }
             for member in members
+            if member.odata_type == '#microsoft.graph.user'
         ]
 
         return member_details
