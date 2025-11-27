@@ -9,6 +9,8 @@ azure-identity = "*"
 msal = "*"
 msgraph-sdk = "*"
 python-dotenv = "*"
+PyJWT = "*"
+cryptography = "*"
 
 [dev-packages]
 

@@ -1,7 +1,8 @@
 import requests
 import asyncio
 import os
-import requests
+import time
+import jwt
 from azure.identity.aio import ClientSecretCredential
 from msgraph import GraphServiceClient
 from msgraph.generated.groups.groups_request_builder import GroupsRequestBuilder
@@ -22,6 +23,46 @@ logging.getLogger('azure.identity.aio').setLevel(logging.WARNING)
 
 # Load environment variables from a .env file
 load_dotenv()
+
+
+def get_github_app_token(app_id: str, installation_id: str, private_key: str) -> str:
+    """
+    Generate an installation access token for a GitHub App.
+
+    :param app_id: GitHub App ID
+    :param installation_id: Installation ID of the App in the organization
+    :param private_key: Private key (PEM format) for the GitHub App
+    :return: Installation access token (valid for 1 hour)
+    """
+    # Create JWT for GitHub App authentication
+    now = int(time.time())
+    payload = {
+        'iat': now - 60,  # Issued at (60s in past for clock skew)
+        'exp': now + 540,  # Expires in 9 minutes (max 10 min)
+        'iss': app_id
+    }
+
+    # Sign JWT with private key
+    app_jwt = jwt.encode(payload, private_key, algorithm='RS256')
+
+    # Exchange JWT for installation access token
+    headers = {
+        'Authorization': f'Bearer {app_jwt}',
+        'Accept': 'application/vnd.github+json',
+        'X-GitHub-Api-Version': '2022-11-28'
+    }
+
+    response = requests.post(
+        f'https://api.github.com/app/installations/{installation_id}/access_tokens',
+        headers=headers
+    )
+
+    if response.status_code == 201:
+        token_data = response.json()
+        logging.debug(f'GitHub App token obtained, expires at: {token_data.get("expires_at")}')
+        return token_data['token']
+    else:
+        raise Exception(f'Error getting GitHub App token: {response.status_code} - {response.text}')
 
 class AzureADGroupMembers:
     def __init__(self, tenant_id: str, client_id: str, client_secret: str):
@@ -458,10 +499,72 @@ class GitHubOrgManager:
         else:
             raise Exception(f'Error retrieving organization information: {response.status_code} - {response.text}')
 
+    def list_repos(self):
+        """
+        List all non-archived repositories in the organization.
+
+        :return: List of repository names.
+        """
+        url = f'{self.base_url}/repos'
+        repos = []
+        page = 1
+        per_page = 100
+
+        while True:
+            params = {'per_page': per_page, 'page': page, 'type': 'all', 'sort': 'full_name', 'direction': 'asc'}
+            response = requests.get(url, headers=self.headers, params=params)
+            if response.status_code == 200:
+                page_repos = response.json()
+                if not page_repos:
+                    break
+                # Filter out archived repos
+                repos.extend([repo['name'] for repo in page_repos if not repo.get('archived', False)])
+                page += 1
+            else:
+                raise Exception(f'Error listing repos: {response.status_code} - {response.text}')
+
+        return repos
+
+    def set_team_repo_permission(self, team_slug, repo_name, permission='pull'):
+        """
+        Set team permission on a repository.
+
+        :param team_slug: Slug of the team.
+        :param repo_name: Name of the repository.
+        :param permission: Permission level (pull, push, admin, maintain, triage).
+        """
+        url = f'{self.base_url}/teams/{team_slug}/repos/{self.org_name}/{repo_name}'
+        data = {'permission': permission}
+        response = requests.put(url, headers=self.headers, json=data)
+        if response.status_code in [200, 204]:
+            logging.debug(f'Team {team_slug} granted {permission} on {repo_name}.')
+        else:
+            raise Exception(f'Error setting team permission: {response.status_code} - {response.text}')
+
 def remove_prefix(text, prefix):
     if text.startswith(prefix):
         return text[len(prefix):]
     return text
+
+
+def should_skip_repo(repo_name: str, ignore_repos: list, ignore_prefixes: list) -> bool:
+    """
+    Check if a repository should be skipped based on ignore lists.
+
+    :param repo_name: Name of the repository.
+    :param ignore_repos: List of exact repo names to ignore.
+    :param ignore_prefixes: List of prefixes to ignore (case-insensitive).
+    :return: True if repo should be skipped.
+    """
+    # Check exact match
+    if repo_name in ignore_repos:
+        return True
+    # Check prefixes (case-insensitive)
+    repo_lower = repo_name.lower()
+    for prefix in ignore_prefixes:
+        if repo_lower.startswith(prefix.lower()):
+            return True
+    return False
 
 async def sync():
     logging.info("SYNC")
@@ -471,7 +574,13 @@ async def sync():
     
     error_log = []
     
-    gh = GitHubOrgManager(os.getenv('GITHUB_TOKEN'), os.getenv('GITHUB_ORG'))
+    # Generate GitHub token from GitHub App
+    github_token = get_github_app_token(
+        app_id=os.getenv('GITHUB_APP_ID'),
+        installation_id=os.getenv('GITHUB_APP_INSTALLATION_ID'),
+        private_key=os.getenv('GITHUB_APP_PRIVATE_KEY')
+    )
+    gh = GitHubOrgManager(github_token, os.getenv('GITHUB_ORG'))
     aad = AzureADGroupMembers(
         tenant_id=os.getenv('AZURE_TENANT_ID'),
         client_id=os.getenv('AZURE_CLIENT_ID'),
@@ -573,7 +682,39 @@ async def sync():
                     error_log.append(f'Error removing user {user} from GH team {gh_team_slug}: {e}')
         except Exception as e:
             error_log.append(f'Error processing AAD group {tmp_group["display_name"]}: {e}')
-            
+
+    # Sync team "all" read permissions on all repos
+    readall_team = os.getenv('READALL_TEAM', 'all')
+    ignore_repos_str = os.getenv('READALL_IGNORE_REPOS', '')
+    ignore_prefixes_str = os.getenv('READALL_IGNORE_PREFIXES', '')
+
+    # Parse ignore lists (comma-separated)
+    ignore_repos = [r.strip() for r in ignore_repos_str.split(',') if r.strip()]
+    ignore_prefixes = [p.strip() for p in ignore_prefixes_str.split(',') if p.strip()]
+
+    logging.info(f'Syncing read permissions for team "{readall_team}"')
+    logging.info(f'Ignore repos: {ignore_repos}')
+    logging.info(f'Ignore prefixes: {ignore_prefixes}')
+
+    try:
+        all_repos = gh.list_repos()
+        logging.info(f'Found {len(all_repos)} non-archived repos')
+
+        for repo in all_repos:
+            if should_skip_repo(repo, ignore_repos, ignore_prefixes):
+                logging.debug(f'Skipping repo {repo} (ignored)')
+                continue
+            try:
+                gh.set_team_repo_permission(readall_team, repo, 'pull')
+                logging.debug(f'Set pull permission for team {readall_team} on {repo}')
+            except Exception as e:
+                error_log.append(f'Error setting permission on repo {repo}: {e}')
+    except Exception as e:
+        error_log.append(f'Error syncing read permissions: {e}')
+
+    return error_log
+
+
 def send_email(errors):
     url = os.getenv('ALERT_EMAIL_URL')
     body = "<h3>Errors:</h3>"
