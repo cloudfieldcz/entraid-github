@@ -702,15 +702,18 @@ async def sync():
 
         for repo in all_repos:
             if should_skip_repo(repo, ignore_repos, ignore_prefixes):
-                logging.debug(f'Skipping repo {repo} (ignored)')
+                logging.info(f'Skipping repo {repo} (ignored)')
                 continue
             try:
                 gh.set_team_repo_permission(readall_team, repo, 'pull')
-                logging.debug(f'Set pull permission for team {readall_team} on {repo}')
+                logging.info(f'Set pull permission for team {readall_team} on {repo}')
             except Exception as e:
                 error_log.append(f'Error setting permission on repo {repo}: {e}')
+        logging.info('Read permissions synced successfully.')
     except Exception as e:
         error_log.append(f'Error syncing read permissions: {e}')
+
+    logging.info('Sync completed with %d errors.', len(error_log))
 
     return error_log
 
