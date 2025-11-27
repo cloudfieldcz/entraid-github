@@ -208,6 +208,12 @@ class AzureADGroupMembers:
         return group_details
 
 class GitHubOrgManager:
+    # Rate limiting configuration
+    MAX_RETRIES = 5
+    BASE_SLEEP = 2  # seconds
+    PAUSE_MUTATION = 0.5  # pause between write operations
+    SAFETY_MARGIN = 5  # if remaining <= margin, wait for reset
+
     def __init__(self, token, org_name):
         """
         Initialize the GitHubOrgManager with a personal access token and organization name.
@@ -224,6 +230,78 @@ class GitHubOrgManager:
         }
         self.base_url = f'https://api.github.com/orgs/{self.org_name}'
 
+    def _handle_rate_limit(self, response):
+        """
+        Check rate limit headers and wait if necessary.
+        """
+        remaining = response.headers.get('X-RateLimit-Remaining')
+        reset_time = response.headers.get('X-RateLimit-Reset')
+
+        if remaining is not None and int(remaining) <= self.SAFETY_MARGIN:
+            if reset_time:
+                wait_time = int(reset_time) - int(time.time()) + 1
+                if wait_time > 0:
+                    logging.warning(f'Rate limit low (remaining={remaining}), waiting {wait_time}s until reset')
+                    time.sleep(wait_time)
+
+    def _request_with_retry(self, method, url, **kwargs):
+        """
+        Make HTTP request with retry logic for rate limits and server errors.
+
+        :param method: HTTP method (get, post, put, delete)
+        :param url: Request URL
+        :param kwargs: Additional arguments for requests
+        :return: Response object
+        """
+        for attempt in range(1, self.MAX_RETRIES + 1):
+            response = getattr(requests, method)(url, headers=self.headers, **kwargs)
+
+            # Check rate limit headers proactively
+            self._handle_rate_limit(response)
+
+            # Success
+            if response.status_code in [200, 201, 202, 204]:
+                return response
+
+            # Rate limit hit (GitHub uses both 403 and 429)
+            if response.status_code in [403, 429]:
+                retry_after = response.headers.get('Retry-After')
+                remaining = response.headers.get('X-RateLimit-Remaining')
+                reset_time = response.headers.get('X-RateLimit-Reset')
+
+                # Secondary rate limit with Retry-After header
+                if retry_after:
+                    wait_time = int(retry_after)
+                    logging.warning(f'Rate limit (HTTP {response.status_code}), Retry-After={wait_time}s, attempt {attempt}/{self.MAX_RETRIES}')
+                    time.sleep(wait_time)
+                    continue
+
+                # Primary rate limit exhausted
+                if remaining is not None and int(remaining) == 0 and reset_time:
+                    wait_time = int(reset_time) - int(time.time()) + 1
+                    if wait_time > 0:
+                        logging.warning(f'Rate limit exhausted (HTTP {response.status_code}), waiting {wait_time}s until reset, attempt {attempt}/{self.MAX_RETRIES}')
+                        time.sleep(wait_time)
+                        continue
+
+                # Secondary rate limit without headers - exponential backoff
+                backoff = self.BASE_SLEEP * (2 ** (attempt - 1))
+                logging.warning(f'Probable secondary rate limit (HTTP {response.status_code}), backoff {backoff}s, attempt {attempt}/{self.MAX_RETRIES}')
+                time.sleep(backoff)
+                continue
+
+            # Server errors - exponential backoff
+            if 500 <= response.status_code < 600:
+                backoff = self.BASE_SLEEP * (2 ** (attempt - 1))
+                logging.warning(f'Server error (HTTP {response.status_code}), backoff {backoff}s, attempt {attempt}/{self.MAX_RETRIES}')
+                time.sleep(backoff)
+                continue
+
+            # Other errors - don't retry
+            break
+
+        return response
+
     def list_users_full(self):
         """
         List all active members in the organization, handling pagination.
@@ -237,7 +315,7 @@ class GitHubOrgManager:
 
         while True:
             params = {'per_page': per_page, 'page': page}
-            response = requests.get(url, headers=self.headers, params=params)
+            response = self._request_with_retry('get', url, params=params)
             if response.status_code == 200:
                 page_members = response.json()
                 if not page_members:
@@ -261,11 +339,12 @@ class GitHubOrgManager:
         """
         url = f'{self.base_url}/invitations'
         data = {'invitee_id': self.get_user_id(username)}
-        response = requests.post(url, headers=self.headers, json=data)
+        response = self._request_with_retry('post', url, json=data)
         if response.status_code == 201:
             logging.debug(f'Invitation sent to {username}.')
         else:
             raise Exception(f'Error inviting user: {response.status_code} - {response.text}')
+        time.sleep(self.PAUSE_MUTATION)  # Pause between mutations
 
     def remove_user(self, username):
         """
@@ -274,11 +353,12 @@ class GitHubOrgManager:
         :param username: GitHub username of the user to remove.
         """
         url = f'{self.base_url}/members/{username}'
-        response = requests.delete(url, headers=self.headers)
+        response = self._request_with_retry('delete', url)
         if response.status_code == 204:
             logging.debug(f'{username} removed from the organization.')
         else:
             raise Exception(f'Error removing user: {response.status_code} - {response.text}')
+        time.sleep(self.PAUSE_MUTATION)  # Pause between mutations
 
     def list_teams(self):
         """
@@ -290,10 +370,10 @@ class GitHubOrgManager:
         teams = []
         page = 1
         per_page = 100
-        
+
         while True:
             params = {'per_page': per_page, 'page': page}
-            response = requests.get(url, headers=self.headers, params=params)
+            response = self._request_with_retry('get', url, params=params)
             if response.status_code == 200:
                 page_teams = response.json()
                 if not page_teams:
@@ -302,7 +382,7 @@ class GitHubOrgManager:
                 page += 1
             else:
                 raise Exception(f'Error listing teams: {response.status_code} - {response.text}')
-        
+
         return [team['slug'] for team in teams]
 
     def create_team(self, team_name):
@@ -313,11 +393,12 @@ class GitHubOrgManager:
         """
         url = f'{self.base_url}/teams'
         data = {'name': team_name}
-        response = requests.post(url, headers=self.headers, json=data)
+        response = self._request_with_retry('post', url, json=data)
         if response.status_code == 201:
             logging.debug(f'Team {team_name} created.')
         else:
             raise Exception(f'Error creating team: {response.status_code} - {response.text}')
+        time.sleep(self.PAUSE_MUTATION)  # Pause between mutations
 
     def get_team_members(self, team_slug):
         """
@@ -333,7 +414,7 @@ class GitHubOrgManager:
 
         while True:
             params = {'per_page': per_page, 'page': page}
-            response = requests.get(url, headers=self.headers, params=params)
+            response = self._request_with_retry('get', url, params=params)
             if response.status_code == 200:
                 page_members = response.json()
                 if not page_members:
@@ -353,11 +434,12 @@ class GitHubOrgManager:
         :param username: GitHub username of the user to add.
         """
         url = f'{self.base_url}/teams/{team_slug}/memberships/{username}'
-        response = requests.put(url, headers=self.headers)
+        response = self._request_with_retry('put', url)
         if response.status_code == 200:
             logging.debug(f'{username} added to team {team_slug}.')
         else:
             raise Exception(f'Error adding user to team: {response.status_code} - {response.text}')
+        time.sleep(self.PAUSE_MUTATION)  # Pause between mutations
 
     def remove_user_from_team(self, team_slug, username):
         """
@@ -367,11 +449,12 @@ class GitHubOrgManager:
         :param username: GitHub username of the user to remove.
         """
         url = f'{self.base_url}/teams/{team_slug}/memberships/{username}'
-        response = requests.delete(url, headers=self.headers)
+        response = self._request_with_retry('delete', url)
         if response.status_code == 204:
             logging.debug(f'{username} removed from team {team_slug}.')
         else:
             raise Exception(f'Error removing user from team: {response.status_code} - {response.text}')
+        time.sleep(self.PAUSE_MUTATION)  # Pause between mutations
 
     def get_pending_invitations(self):
         """
@@ -386,7 +469,7 @@ class GitHubOrgManager:
 
         while True:
             params = {'per_page': per_page, 'page': page}
-            response = requests.get(url, headers=self.headers, params=params)
+            response = self._request_with_retry('get', url, params=params)
             if response.status_code == 200:
                 page_invitations = response.json()
                 if not page_invitations:
@@ -421,7 +504,7 @@ class GitHubOrgManager:
         :return: Dictionary with billing information.
         """
         url = f'{self.base_url}/billing'
-        response = requests.get(url, headers=self.headers)
+        response = self._request_with_retry('get', url)
         if response.status_code == 200:
             billing_info = response.json()
             return {
@@ -439,7 +522,7 @@ class GitHubOrgManager:
         :return: Dictionary with total seats and seats in use.
         """
         url = f'{self.base_url}/copilot/billing'
-        response = requests.get(url, headers=self.headers)
+        response = self._request_with_retry('get', url)
         if response.status_code == 200:
             return response.json()
         else:
@@ -452,11 +535,12 @@ class GitHubOrgManager:
         :param username: GitHub username of the user to assign.
         """
         url = f'{self.base_url}/copilot/billing/selected_users/{username}'
-        response = requests.put(url, headers=self.headers)
+        response = self._request_with_retry('put', url)
         if response.status_code == 204:
             logging.debug(f'Copilot seat assigned to {username}.')
         else:
             raise Exception(f'Error assigning Copilot seat: {response.status_code} - {response.text}')
+        time.sleep(self.PAUSE_MUTATION)  # Pause between mutations
 
     def unassign_copilot_seat(self, username):
         """
@@ -465,11 +549,12 @@ class GitHubOrgManager:
         :param username: GitHub username of the user to unassign.
         """
         url = f'{self.base_url}/copilot/billing/selected_users/{username}'
-        response = requests.delete(url, headers=self.headers)
+        response = self._request_with_retry('delete', url)
         if response.status_code == 204:
             logging.debug(f'Copilot seat unassigned from {username}.')
         else:
             raise Exception(f'Error unassigning Copilot seat: {response.status_code} - {response.text}')
+        time.sleep(self.PAUSE_MUTATION)  # Pause between mutations
 
     def get_user_id(self, username):
         """
@@ -479,7 +564,7 @@ class GitHubOrgManager:
         :return: User ID.
         """
         url = f'https://api.github.com/users/{username}'
-        response = requests.get(url, headers=self.headers)
+        response = self._request_with_retry('get', url)
         if response.status_code == 200:
             user_info = response.json()
             return user_info['id']
@@ -493,7 +578,7 @@ class GitHubOrgManager:
         :return: Dictionary with organization information.
         """
         url = f'{self.base_url}'
-        response = requests.get(url, headers=self.headers)
+        response = self._request_with_retry('get', url)
         if response.status_code == 200:
             return response.json()
         else:
@@ -512,7 +597,7 @@ class GitHubOrgManager:
 
         while True:
             params = {'per_page': per_page, 'page': page, 'type': 'all', 'sort': 'full_name', 'direction': 'asc'}
-            response = requests.get(url, headers=self.headers, params=params)
+            response = self._request_with_retry('get', url, params=params)
             if response.status_code == 200:
                 page_repos = response.json()
                 if not page_repos:
@@ -535,11 +620,12 @@ class GitHubOrgManager:
         """
         url = f'{self.base_url}/teams/{team_slug}/repos/{self.org_name}/{repo_name}'
         data = {'permission': permission}
-        response = requests.put(url, headers=self.headers, json=data)
+        response = self._request_with_retry('put', url, json=data)
         if response.status_code in [200, 204]:
             logging.debug(f'Team {team_slug} granted {permission} on {repo_name}.')
         else:
             raise Exception(f'Error setting team permission: {response.status_code} - {response.text}')
+        time.sleep(self.PAUSE_MUTATION)  # Pause between mutations
 
 def remove_prefix(text, prefix):
     if text.startswith(prefix):
