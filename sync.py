@@ -25,44 +25,75 @@ logging.getLogger('azure.identity.aio').setLevel(logging.WARNING)
 load_dotenv()
 
 
-def get_github_app_token(app_id: str, installation_id: str, private_key: str) -> str:
+class GitHubAppTokenManager:
     """
-    Generate an installation access token for a GitHub App.
-
-    :param app_id: GitHub App ID
-    :param installation_id: Installation ID of the App in the organization
-    :param private_key: Private key (PEM format) for the GitHub App
-    :return: Installation access token (valid for 1 hour)
+    Manages GitHub App installation tokens with automatic refresh.
+    Tokens are valid for 1 hour, but we refresh 5 minutes before expiry.
     """
-    # Create JWT for GitHub App authentication
-    now = int(time.time())
-    payload = {
-        'iat': now - 60,  # Issued at (60s in past for clock skew)
-        'exp': now + 540,  # Expires in 9 minutes (max 10 min)
-        'iss': app_id
-    }
+    TOKEN_REFRESH_MARGIN = 300  # Refresh 5 minutes before expiry
 
-    # Sign JWT with private key
-    app_jwt = jwt.encode(payload, private_key, algorithm='RS256')
+    def __init__(self, app_id: str, installation_id: str, private_key: str):
+        self.app_id = app_id
+        self.installation_id = installation_id
+        self.private_key = private_key
+        self.token = None
+        self.token_expires_at = 0
 
-    # Exchange JWT for installation access token
-    headers = {
-        'Authorization': f'Bearer {app_jwt}',
-        'Accept': 'application/vnd.github+json',
-        'X-GitHub-Api-Version': '2022-11-28'
-    }
+    def _fetch_token(self) -> tuple[str, int]:
+        """
+        Fetch a new installation access token from GitHub.
 
-    response = requests.post(
-        f'https://api.github.com/app/installations/{installation_id}/access_tokens',
-        headers=headers
-    )
+        :return: Tuple of (token, expires_at_timestamp)
+        """
+        # Create JWT for GitHub App authentication
+        now = int(time.time())
+        payload = {
+            'iat': now - 60,  # Issued at (60s in past for clock skew)
+            'exp': now + 540,  # Expires in 9 minutes (max 10 min)
+            'iss': self.app_id
+        }
 
-    if response.status_code == 201:
-        token_data = response.json()
-        logging.debug(f'GitHub App token obtained, expires at: {token_data.get("expires_at")}')
-        return token_data['token']
-    else:
-        raise Exception(f'Error getting GitHub App token: {response.status_code} - {response.text}')
+        # Sign JWT with private key
+        app_jwt = jwt.encode(payload, self.private_key, algorithm='RS256')
+
+        # Exchange JWT for installation access token
+        headers = {
+            'Authorization': f'Bearer {app_jwt}',
+            'Accept': 'application/vnd.github+json',
+            'X-GitHub-Api-Version': '2022-11-28'
+        }
+
+        response = requests.post(
+            f'https://api.github.com/app/installations/{self.installation_id}/access_tokens',
+            headers=headers
+        )
+
+        if response.status_code == 201:
+            token_data = response.json()
+            # Parse expires_at (ISO format: 2024-01-01T12:00:00Z)
+            expires_at_str = token_data.get('expires_at', '')
+            if expires_at_str:
+                from datetime import datetime
+                expires_at = int(datetime.fromisoformat(expires_at_str.replace('Z', '+00:00')).timestamp())
+            else:
+                # Fallback: assume 1 hour from now
+                expires_at = now + 3600
+            logging.debug(f'GitHub App token obtained, expires at: {expires_at_str}')
+            return token_data['token'], expires_at
+        else:
+            raise Exception(f'Error getting GitHub App token: {response.status_code} - {response.text}')
+
+    def get_token(self) -> str:
+        """
+        Get a valid token, refreshing if necessary.
+
+        :return: Valid installation access token
+        """
+        now = int(time.time())
+        if self.token is None or now >= (self.token_expires_at - self.TOKEN_REFRESH_MARGIN):
+            logging.info('Refreshing GitHub App token...')
+            self.token, self.token_expires_at = self._fetch_token()
+        return self.token
 
 class AzureADGroupMembers:
     def __init__(self, tenant_id: str, client_id: str, client_secret: str):
@@ -215,21 +246,24 @@ class GitHubOrgManager:
     PAUSE_MUTATION = 0.5  # pause between write operations
     SAFETY_MARGIN = 5  # if remaining <= margin, wait for reset
 
-    def __init__(self, token, org_name):
+    def __init__(self, token_manager: GitHubAppTokenManager, org_name: str):
         """
-        Initialize the GitHubOrgManager with a personal access token and organization name.
+        Initialize the GitHubOrgManager with a token manager and organization name.
 
-        :param token: Personal Access Token with appropriate scopes.
+        :param token_manager: GitHubAppTokenManager instance for automatic token refresh.
         :param org_name: Name of the GitHub organization.
         """
-        self.token = token
+        self.token_manager = token_manager
         self.org_name = org_name
-        self.headers = {
-            'Authorization': f'Bearer {self.token}',
+        self.base_url = f'https://api.github.com/orgs/{self.org_name}'
+
+    def _get_headers(self):
+        """Get headers with fresh token."""
+        return {
+            'Authorization': f'Bearer {self.token_manager.get_token()}',
             'Accept': 'application/vnd.github+json',
             'X-GitHub-Api-Version': '2022-11-28'
         }
-        self.base_url = f'https://api.github.com/orgs/{self.org_name}'
 
     def _handle_rate_limit(self, response):
         """
@@ -255,7 +289,8 @@ class GitHubOrgManager:
         :return: Response object
         """
         for attempt in range(1, self.MAX_RETRIES + 1):
-            response = getattr(requests, method)(url, headers=self.headers, **kwargs)
+            # Get fresh headers (with potentially refreshed token) for each attempt
+            response = getattr(requests, method)(url, headers=self._get_headers(), **kwargs)
 
             # Check rate limit headers proactively
             self._handle_rate_limit(response)
@@ -296,6 +331,14 @@ class GitHubOrgManager:
                 backoff = self.BASE_SLEEP * (2 ** (attempt - 1))
                 logging.warning(f'Server error (HTTP {response.status_code}), backoff {backoff}s, attempt {attempt}/{self.MAX_RETRIES}')
                 time.sleep(backoff)
+                continue
+
+            # 401 Unauthorized - token might have expired, force refresh and retry
+            if response.status_code == 401:
+                logging.warning(f'Unauthorized (HTTP 401), forcing token refresh, attempt {attempt}/{self.MAX_RETRIES}')
+                # Force token refresh by resetting expiry
+                self.token_manager.token_expires_at = 0
+                time.sleep(self.BASE_SLEEP)
                 continue
 
             # Other errors - don't retry
@@ -661,13 +704,13 @@ async def sync():
     
     error_log = []
     
-    # Generate GitHub token from GitHub App
-    github_token = get_github_app_token(
+    # Create token manager for automatic token refresh
+    token_manager = GitHubAppTokenManager(
         app_id=os.getenv('GITHUB_APP_ID'),
         installation_id=os.getenv('GITHUB_APP_INSTALLATION_ID'),
         private_key=os.getenv('GITHUB_APP_PRIVATE_KEY')
     )
-    gh = GitHubOrgManager(github_token, os.getenv('GITHUB_ORG'))
+    gh = GitHubOrgManager(token_manager, os.getenv('GITHUB_ORG'))
     aad = AzureADGroupMembers(
         tenant_id=os.getenv('AZURE_TENANT_ID'),
         client_id=os.getenv('AZURE_CLIENT_ID'),
