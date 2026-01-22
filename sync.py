@@ -3,11 +3,13 @@ import asyncio
 import os
 import time
 import jwt
+import signal
 from azure.identity.aio import ClientSecretCredential
 from msgraph import GraphServiceClient
 from msgraph.generated.groups.groups_request_builder import GroupsRequestBuilder
 from dotenv import load_dotenv
 import logging
+from pim_db import PIMStateDB
 
 # log format with timestamp 
 LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
@@ -132,7 +134,7 @@ class AzureADGroupMembers:
 
         members = []
         query_params = GroupsRequestBuilder.GroupsRequestBuilderGetQueryParameters(
-            select = ['id', 'displayName', 'postalCode'],
+            select = ['id', 'displayName', 'postalCode', 'mail', 'userPrincipalName'],
         )
         request_configuration = GroupsRequestBuilder.GroupsRequestBuilderGetRequestConfiguration(
             query_parameters = query_params,
@@ -159,6 +161,7 @@ class AzureADGroupMembers:
                 'display_name': member.display_name,
                 'type': member.odata_type,
                 'github_username': member.postal_code,
+                'email': member.mail or member.user_principal_name,
             }
             for member in members
             if member.odata_type == '#microsoft.graph.user'
@@ -374,6 +377,58 @@ class GitHubOrgManager:
     def list_users(self):
         members = self.list_users_full()
         return [member['login'] for member in members]
+
+    def list_owners(self):
+        """
+        List all organization owners.
+
+        :return: List of owner usernames.
+        """
+        url = f'{self.base_url}/members'
+        owners = []
+        page = 1
+        per_page = 100
+
+        while True:
+            params = {'role': 'admin', 'per_page': per_page, 'page': page}
+            response = self._request_with_retry('get', url, params=params)
+            if response.status_code == 200:
+                page_owners = response.json()
+                if not page_owners:
+                    break
+                owners.extend([owner['login'] for owner in page_owners])
+                page += 1
+            else:
+                raise Exception(f'Error listing owners: {response.status_code} - {response.text}')
+
+        return owners
+
+    def set_member_role(self, username, role='member'):
+        """
+        Set the organization membership role for a user.
+
+        :param username: GitHub username.
+        :param role: Role to set ('admin' for owner, 'member' for regular member).
+        """
+        url = f'{self.base_url}/memberships/{username}'
+        data = {'role': role}
+        response = self._request_with_retry('put', url, json=data)
+        if response.status_code == 200:
+            logging.debug(f'Set role {role} for {username}.')
+        else:
+            raise Exception(f'Error setting member role: {response.status_code} - {response.text}')
+        time.sleep(self.PAUSE_MUTATION)  # Pause between mutations
+
+    def is_org_member(self, username):
+        """
+        Check if a user is a member of the organization.
+
+        :param username: GitHub username.
+        :return: True if user is a member, False otherwise.
+        """
+        url = f'{self.base_url}/members/{username}'
+        response = self._request_with_retry('get', url)
+        return response.status_code == 204
 
     def invite_user(self, username):
         """
@@ -861,14 +916,315 @@ def send_email(errors):
     logging.warning(f"Sending email with errors to {data['recipient']}")
     response = requests.post(url, json=data)
 
+def notify_user(email: str, action: str, display_name: str, org_name: str):
+    """
+    Send email notification to user about role change.
+
+    :param email: User's email address.
+    :param action: 'promoted' or 'demoted'.
+    :param display_name: User's display name.
+    :param org_name: GitHub organization name.
+    """
+    # Check if user notifications are enabled
+    if os.getenv('PIM_NOTIFY_USERS', 'true').lower() != 'true':
+        return
+
+    url = os.getenv('ALERT_EMAIL_URL')
+    if not url:
+        logging.warning('PIM_NOTIFY_USERS is enabled but ALERT_EMAIL_URL is not set')
+        return
+
+    if action == 'promoted':
+        subject = 'GitHub Owner Access Granted'
+        body = f'''<h3>GitHub Owner Access Granted</h3>
+<p>Hi {display_name},</p>
+<p>You have been granted Owner access to the GitHub organization <strong>{org_name}</strong>.</p>
+<p>This access was activated through Entra ID PIM.</p>
+<p><strong>Remember:</strong> This access will be automatically revoked when your PIM session expires.</p>
+'''
+    else:  # demoted
+        subject = 'GitHub Owner Access Revoked'
+        body = f'''<h3>GitHub Owner Access Revoked</h3>
+<p>Hi {display_name},</p>
+<p>Your Owner access to the GitHub organization <strong>{org_name}</strong> has been revoked.</p>
+<p>You are now a regular member of the organization.</p>
+<p>If you need Owner access again, please activate it through Entra ID PIM.</p>
+'''
+
+    data = {
+        "recipient": email,
+        "subject": subject,
+        "body": body
+    }
+
+    try:
+        logging.info(f'Sending {action} notification to {email}')
+        response = requests.post(url, json=data, timeout=10)
+        if response.status_code not in [200, 201, 202]:
+            logging.warning(f'Failed to send notification email: {response.status_code} - {response.text}')
+    except Exception as e:
+        # Don't fail the sync if email notification fails
+        logging.warning(f'Error sending notification email to {email}: {e}')
+
+async def sync_pim_owners():
+    """
+    Fast synchronization of PIM-based GitHub organization owners.
+
+    Uses a stateful approach: only demotes users that we promoted.
+    This provides implicit protection for break-glass accounts and service accounts.
+    """
+    logging.info("PIM OWNERS SYNC")
+
+    pim_group_name = os.getenv('PIM_OWNERS_GROUP', 'github_pim_owners')
+    db_path = os.getenv('PIM_STATE_FILE', '/data/pim_state.db')
+    org_name = os.getenv('GITHUB_ORG')
+
+    error_log = []
+
+    # Initialize database
+    try:
+        db = PIMStateDB(db_path)
+        db.connect()
+    except Exception as e:
+        error_msg = f'CRITICAL: PIM state database unavailable - {e}'
+        logging.critical(error_msg)
+        error_log.append(error_msg)
+        send_alert_email('PIM state database error - manual intervention required')
+        return error_log
+
+    try:
+        # Create token manager and clients
+        token_manager = GitHubAppTokenManager(
+            app_id=os.getenv('GITHUB_APP_ID'),
+            installation_id=os.getenv('GITHUB_APP_INSTALLATION_ID'),
+            private_key=os.getenv('GITHUB_APP_PRIVATE_KEY')
+        )
+        gh = GitHubOrgManager(token_manager, org_name)
+        aad = AzureADGroupMembers(
+            tenant_id=os.getenv('AZURE_TENANT_ID'),
+            client_id=os.getenv('AZURE_CLIENT_ID'),
+            client_secret=os.getenv('AZURE_CLIENT_SECRET'),
+        )
+
+        # 1. Get members of Entra ID PIM owners group
+        pim_members = []
+        try:
+            pim_members = await aad.get_group_members(pim_group_name)
+            if pim_members is None:
+                pim_members = []
+        except Exception as e:
+            error_msg = f'Error fetching PIM group members: {e}'
+            logging.error(error_msg)
+            error_log.append(error_msg)
+            db.close()
+            return error_log
+
+        # Empty PIM group protection: treat as error, not "demote all"
+        if len(pim_members) == 0:
+            error_msg = 'PIM group returned 0 members - treating as API error'
+            logging.error(error_msg)
+            error_log.append(error_msg)
+            db.close()
+            return error_log
+
+        logging.info(f'PIM group has {len(pim_members)} members')
+        pim_logins = {m['github_username'] for m in pim_members if m.get('github_username')}
+
+        # 2. Get users WE have promoted (from local DB)
+        our_promoted = db.get_promoted_users()
+        our_promoted_logins = {u['github_login'] for u in our_promoted}
+        logging.info(f'We have promoted {len(our_promoted)} users')
+
+        # 3. Promote: users in PIM but not yet promoted by us
+        to_promote = [m for m in pim_members
+                     if m.get('github_username')
+                     and m['github_username'] not in our_promoted_logins]
+
+        for member in to_promote:
+            login = member['github_username']
+            try:
+                # Check if user is an org member
+                if not gh.is_org_member(login):
+                    logging.warning(f'User {login} is in PIM group but not in GitHub org - skipping')
+                    continue
+
+                # Promote to owner
+                gh.set_member_role(login, role='admin')
+
+                # Save to database
+                db.save_promoted_user(
+                    github_login=login,
+                    entra_id=member['id'],
+                    email=member.get('email', ''),
+                    display_name=member.get('display_name', '')
+                )
+
+                # Audit log
+                logging.info(f'AUDIT: action=promoted user={login} entra_id={member["id"]} trigger=pim_sync')
+
+                # Notify user
+                if member.get('email'):
+                    notify_user(member['email'], 'promoted', member.get('display_name', login), org_name)
+
+            except Exception as e:
+                error_msg = f'Error promoting user {login}: {e}'
+                logging.error(error_msg)
+                error_log.append(error_msg)
+
+        # 4. Demote: users WE promoted who are no longer in PIM
+        to_demote = [u for u in our_promoted if u['github_login'] not in pim_logins]
+
+        if to_demote:
+            # Safety check: ensure we don't remove last owner
+            try:
+                current_owners = gh.list_owners()
+                if len(current_owners) - len(to_demote) < 1:
+                    error_msg = 'Cannot demote: would leave org with 0 owners'
+                    logging.error(error_msg)
+                    error_log.append(error_msg)
+                    send_alert_email('PIM sync blocked - would remove last owner')
+                    db.close()
+                    return error_log
+            except Exception as e:
+                error_msg = f'Error checking owner count: {e}'
+                logging.error(error_msg)
+                error_log.append(error_msg)
+                db.close()
+                return error_log
+
+        for user in to_demote:
+            login = user['github_login']
+            try:
+                # Demote to member
+                gh.set_member_role(login, role='member')
+
+                # Remove from database
+                db.remove_promoted_user(login)
+
+                # Audit log
+                logging.info(f'AUDIT: action=demoted user={login} entra_id={user["entra_id"]} trigger=pim_sync')
+
+                # Notify user
+                if user.get('email'):
+                    notify_user(user['email'], 'demoted', user.get('display_name', login), org_name)
+
+            except Exception as e:
+                error_msg = f'Error demoting user {login}: {e}'
+                logging.error(error_msg)
+                error_log.append(error_msg)
+
+        logging.info(f'PIM sync completed: promoted {len(to_promote)}, demoted {len(to_demote)}')
+
+    except Exception as e:
+        error_msg = f'Unexpected error in PIM sync: {e}'
+        logging.error(error_msg)
+        error_log.append(error_msg)
+    finally:
+        db.close()
+
+    return error_log
+
+def send_alert_email(message: str):
+    """
+    Send alert email to admin.
+
+    :param message: Alert message to send.
+    """
+    url = os.getenv('ALERT_EMAIL_URL')
+    if not url:
+        logging.warning('Cannot send alert: ALERT_EMAIL_URL not set')
+        return
+
+    data = {
+        "recipient": os.getenv('ALERT_EMAIL_RECIPIENT'),
+        "subject": "PIM Sync Alert",
+        "body": f"<h3>PIM Sync Alert</h3><p>{message}</p>"
+    }
+
+    try:
+        response = requests.post(url, json=data, timeout=10)
+        if response.status_code not in [200, 201, 202]:
+            logging.warning(f'Failed to send alert email: {response.status_code}')
+    except Exception as e:
+        logging.warning(f'Error sending alert email: {e}')
+
+def write_health_check():
+    """Write current timestamp to health check file."""
+    try:
+        with open('/tmp/healthcheck', 'w') as f:
+            f.write(str(int(time.time())))
+    except Exception as e:
+        logging.debug(f'Failed to write health check file: {e}')
+
+# Global flag for graceful shutdown
+shutdown_requested = False
+
+def handle_sigterm(signum, frame):
+    """Handle SIGTERM signal for graceful shutdown."""
+    global shutdown_requested
+    shutdown_requested = True
+    logging.info('Shutdown requested, finishing current cycle...')
+
+# Register signal handler
+signal.signal(signal.SIGTERM, handle_sigterm)
+signal.signal(signal.SIGINT, handle_sigterm)
+
 async def main():
-    err_log = await sync()
-    if err_log:
-        logging.error('Errors:')
-        for err in err_log:
-            logging.error(err)
-        send_email(err_log)
+    import argparse
+
+    parser = argparse.ArgumentParser(description='GitHub-Entra ID Sync Tool')
+    parser.add_argument('--mode', choices=['full', 'pim-owners'], default='full',
+                       help='Sync mode: full (default) or pim-owners (fast PIM owner sync)')
+    parser.add_argument('--continuous', action='store_true',
+                       help='Run continuously (for PIM mode)')
+    parser.add_argument('--interval', type=int, default=30,
+                       help='Interval in seconds for continuous mode (default: 30)')
+
+    args = parser.parse_args()
+
+    if args.mode == 'pim-owners':
+        # PIM owners sync mode
+        if args.continuous:
+            logging.info(f'Starting continuous PIM sync with {args.interval}s interval')
+            while not shutdown_requested:
+                err_log = await sync_pim_owners()
+                if err_log:
+                    logging.error(f'PIM sync completed with {len(err_log)} errors')
+                    for err in err_log:
+                        logging.error(err)
+                    send_email(err_log)
+                else:
+                    logging.info('PIM sync completed successfully')
+
+                # Write health check file
+                write_health_check()
+
+                # Wait for next cycle (unless shutdown requested)
+                for _ in range(args.interval):
+                    if shutdown_requested:
+                        break
+                    time.sleep(1)
+
+            logging.info('Shutdown complete')
+        else:
+            # Single run
+            err_log = await sync_pim_owners()
+            if err_log:
+                logging.error('Errors:')
+                for err in err_log:
+                    logging.error(err)
+                send_email(err_log)
+            else:
+                logging.info('PIM sync completed successfully')
     else:
-        logging.info('Sync completed successfully.')
+        # Full sync mode (original behavior)
+        err_log = await sync()
+        if err_log:
+            logging.error('Errors:')
+            for err in err_log:
+                logging.error(err)
+            send_email(err_log)
+        else:
+            logging.info('Sync completed successfully.')
 
 asyncio.run(main())

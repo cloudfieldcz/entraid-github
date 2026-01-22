@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  # Full synchronization (run on schedule via external cron or scheduler)
+  sync:
+    build: .
+    env_file: .env
+    command: python sync.py
+    restart: "no"
+
+  # PIM owner sync (runs continuously with 30-second interval)
+  pim-sync:
+    build: .
+    env_file: .env
+    command: python sync.py --mode pim-owners --continuous --interval 30
+    restart: always
+    volumes:
+      - pim-data:/data
+    healthcheck:
+      test: ["CMD", "sh", "-c", "[ $$(($$(date +%s) - $$(cat /tmp/healthcheck 2>/dev/null || echo 0))) -lt 120 ]"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  pim-data:
+    driver: local

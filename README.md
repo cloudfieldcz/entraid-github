@@ -69,11 +69,160 @@ The `github_all` group should be a dynamic group with rule like:
 (user.postalCode -ne null) and (user.accountEnabled -eq true)
 ```
 
+## PIM Owner Sync (Privileged Identity Management)
+
+GitHub Team license doesn't have native PIM like Azure/Entra ID. This feature enables temporary elevation of users to GitHub Organization Owner via Entra ID PIM.
+
+### How PIM Sync Works
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              ENTRA ID                                       │
+│                                                                             │
+│  ┌─────────────────────────────┐      ┌─────────────────────────────┐       │
+│  │  github_pim_owners          │      │  Entra ID PIM               │       │
+│  │  (security group)           │◄─────│  (user activates role)      │       │
+│  ├─────────────────────────────┤      └─────────────────────────────┘       │
+│  │ user1 (active PIM)          │                                            │
+│  │ user2 (active PIM)          │                                            │
+│  └─────────────────────────────┘                                            │
+└────────────────────────────────────────┬────────────────────────────────────┘
+                                         │
+                                         │  sync.py --mode pim-owners
+                                         │  (runs continuously, 30s interval)
+                                         ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           SYNC PROCESS                                      │
+│  ┌─────────────────────────────┐                                            │
+│  │  SQLite: promoted_owners    │  ← Tracks users WE promoted                │
+│  ├─────────────────────────────┤                                            │
+│  │ user1_gh (promoted by us)   │                                            │
+│  │ user2_gh (promoted by us)   │                                            │
+│  └─────────────────────────────┘                                            │
+│                                                                             │
+│  Logic: Only demote users in our DB that are no longer in PIM group         │
+└────────────────────────────────────────┬────────────────────────────────────┘
+                                         │
+                                         ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                         GITHUB ORGANIZATION                                 │
+│                                                                             │
+│  OWNERS (role=admin):                  NEVER TOUCHED (not in our DB):       │
+│  ┌─────────────────────────────┐       ┌─────────────────────────────┐      │
+│  │ user1_gh (from PIM)         │       │ break-glass-admin           │      │
+│  │ user2_gh (from PIM)         │       │ service-account             │      │
+│  │ break-glass-admin           │       │ manual-owner                │      │
+│  │ service-account             │       └─────────────────────────────┘      │
+│  └─────────────────────────────┘                                            │
+│                                                                             │
+│  MEMBERS (role=member):                                                     │
+│  ┌─────────────────────────────┐                                            │
+│  │ user3_gh (regular member)   │                                            │
+│  │ user4_gh (PIM expired)      │  ← demoted because was in our DB           │
+│  └─────────────────────────────┘                                            │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### User Workflow
+
+1. User needs owner privileges on GitHub
+2. Activates PIM role in Entra ID (e.g., "GitHub Owner")
+3. PIM adds user to `github_pim_owners` group
+4. Within 30 seconds, sync detects the change
+5. User is promoted to GitHub Organization Owner
+6. User receives email notification about the promotion
+7. After PIM expires, user is removed from the group
+8. Within 30 seconds, user is demoted back to member
+9. User receives email notification about the demotion
+
+### Stateful Approach - Safety by Design
+
+Unlike traditional whitelisting, PIM sync uses a **stateful approach**:
+- We track which users **we promoted** in a local SQLite database
+- We **only demote users that we promoted**
+- This provides implicit protection for:
+  - Break-glass accounts (we never promoted them)
+  - Service accounts (we never promoted them)
+  - Manual owner assignments (we never promoted them)
+- No whitelist configuration needed
+- No risk of accidental mass demotion due to config errors
+
+### Safety Mechanisms
+
+1. **Minimum Owner Count**: Never reduces owner count below 1
+2. **Empty PIM Group Protection**: Empty group is treated as error, not "demote all"
+3. **Fail-Safe on Errors**: API errors prevent any demotions
+4. **Database Loss Protection**: If DB is lost, no demotions occur (alert sent)
+5. **Audit Logging**: All owner changes logged with timestamp, user, and trigger
+
+### PIM Sync Commands
+
+```bash
+# Single run of PIM sync
+python sync.py --mode pim-owners
+
+# Continuous run with 30-second interval (default for deployment)
+python sync.py --mode pim-owners --continuous --interval 30
+
+# Custom interval (e.g., 60 seconds)
+python sync.py --mode pim-owners --continuous --interval 60
+
+# Regular full sync (unchanged)
+python sync.py
+```
+
+### PIM Configuration
+
+Add these environment variables to your `.env` file:
+
+```bash
+# PIM Owner sync configuration
+PIM_OWNERS_GROUP=github_pim_owners              # Entra ID group for PIM owners
+PIM_STATE_FILE=/data/pim_state.db               # SQLite file for tracking promoted users
+PIM_NOTIFY_USERS=true                           # Send email to users on role change
+```
+
+### Deployment with Docker Compose
+
+Use the provided `docker-compose.yml`:
+
+```bash
+# Start PIM sync service (runs continuously)
+docker-compose up -d pim-sync
+
+# Run full sync once
+docker-compose run --rm sync
+
+# View PIM sync logs
+docker-compose logs -f pim-sync
+
+# Stop PIM sync
+docker-compose down
+```
+
+The PIM sync service includes:
+- Automatic restart on failure
+- Health check monitoring (alerts if sync hasn't run in 2 minutes)
+- Persistent volume for SQLite database
+- Graceful shutdown handling (SIGTERM)
+
+### IMPORTANT: postalCode Security
+
+The security of this system depends on users **NOT** being able to modify their own `postalCode` attribute in Entra ID.
+
+**Why this matters:**
+- If a malicious user can modify their `postalCode` to match an existing GitHub username
+- They could get added to `github_pim_owners` group
+- And gain owner access to the organization
+
+**Recommendation:** Periodically audit Entra ID permissions to ensure `postalCode` write access remains restricted to admins only.
+
 ## Known limitations
 
 - Script cannot manipulate with GitHub seats, so you need to have enough seats for all users
 - No support for GitHub Enterprise (only Free/Team plans)
 - User mapping relies on `postalCode` field (not ideal but works)
+- PIM sync requires SQLite database persistence (volume must be backed up)
 
 ## Configuration
 
@@ -162,7 +311,31 @@ docker build -t YOUR_DOCKER_IMAGE_NAME .
 
 ## How to use
 
+### Using Docker Compose (Recommended)
+
 ```bash
-# this command can be scheduled in cron
+# Start PIM sync service (runs continuously in background)
+docker-compose up -d pim-sync
+
+# Run full sync once (can be scheduled via cron)
+docker-compose run --rm sync
+
+# View PIM sync logs
+docker-compose logs -f pim-sync
+
+# Stop all services
+docker-compose down
+```
+
+### Using Docker directly
+
+```bash
+# Full sync (can be scheduled in cron)
 docker run -it --rm -v $(pwd)/.env:/app/.env -w /app YOUR_DOCKER_IMAGE_NAME python sync.py
+
+# PIM sync (single run)
+docker run -it --rm -v $(pwd)/.env:/app/.env -v pim-data:/data -w /app YOUR_DOCKER_IMAGE_NAME python sync.py --mode pim-owners
+
+# PIM sync (continuous)
+docker run -it --rm -v $(pwd)/.env:/app/.env -v pim-data:/data -w /app YOUR_DOCKER_IMAGE_NAME python sync.py --mode pim-owners --continuous --interval 30
 ```
