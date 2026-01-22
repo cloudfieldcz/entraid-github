@@ -7,7 +7,7 @@ GitHub Team license doesn't have native PIM (Privileged Identity Management) lik
 - Temporary elevation of users to **GitHub Organization Owner**
 - Activation via Entra ID PIM (existing mechanism)
 - Fast synchronization (every 30 seconds)
-- Safety mechanisms (break-glass account, whitelist)
+- Safety mechanisms (break-glass account protection, stateful tracking)
 
 ## Architecture
 
@@ -28,19 +28,33 @@ GitHub Team license doesn't have native PIM (Privileged Identity Management) lik
                                          │  (runs continuously, 30s interval)
                                          ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
+│                           SYNC PROCESS                                      │
+│  ┌─────────────────────────────┐                                            │
+│  │  SQLite: promoted_owners    │  ← Tracks users WE promoted                │
+│  ├─────────────────────────────┤                                            │
+│  │ user1_gh (promoted by us)   │                                            │
+│  │ user2_gh (promoted by us)   │                                            │
+│  └─────────────────────────────┘                                            │
+│                                                                             │
+│  Logic: Only demote users in our DB that are no longer in PIM group         │
+└────────────────────────────────────────┬────────────────────────────────────┘
+                                         │
+                                         ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
 │                         GITHUB ORGANIZATION                                 │
 │                                                                             │
-│  OWNERS (role=admin):                  WHITELIST (never remove):            │
+│  OWNERS (role=admin):                  NEVER TOUCHED (not in our DB):       │
 │  ┌─────────────────────────────┐       ┌─────────────────────────────┐      │
 │  │ user1_gh (from PIM)         │       │ break-glass-admin           │      │
 │  │ user2_gh (from PIM)         │       │ service-account             │      │
-│  │ break-glass-admin           │       └─────────────────────────────┘      │
+│  │ break-glass-admin           │       │ manual-owner                │      │
+│  │ service-account             │       └─────────────────────────────┘      │
 │  └─────────────────────────────┘                                            │
 │                                                                             │
 │  MEMBERS (role=member):                                                     │
 │  ┌─────────────────────────────┐                                            │
 │  │ user3_gh (regular member)   │                                            │
-│  │ user4_gh (PIM expired)      │  ← demoted from owner to member            │
+│  │ user4_gh (PIM expired)      │  ← demoted because was in our DB           │
 │  └─────────────────────────────┘                                            │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -75,46 +89,76 @@ python sync.py --mode pim-owners --continuous --interval 30
 ```bash
 # PIM Owner sync configuration
 PIM_OWNERS_GROUP=github_pim_owners              # Entra ID group for PIM owners
-PIM_OWNERS_WHITELIST=break-glass-admin,svc-github  # Never remove from owners
 PIM_SYNC_INTERVAL=30                            # Default interval in seconds
+PIM_STATE_FILE=/data/pim_state.db               # SQLite file for tracking promoted users
 
 # User notification (reuses existing ALERT_EMAIL_URL)
 PIM_NOTIFY_USERS=true                           # Send email to users on role change
 ```
 
+> **Note**: `PIM_OWNERS_WHITELIST` is no longer needed - the stateful approach provides implicit protection for all users we didn't promote.
+
 ## Synchronization Logic
 
+### Stateful Approach (Recommended)
+
+Instead of comparing PIM group vs all GitHub owners, we track which users **we promoted**. This provides:
+- **Implicit whitelist safety** - We never touch users we didn't promote (break-glass, service accounts)
+- **No reverse lookup needed** - User info stored on promotion
+- **Fewer API calls** - Only check users we're tracking
+- **Config typo protection** - Misconfigured whitelist can't cause accidental demotions
+
 ```python
+# SQLite schema
+CREATE TABLE promoted_owners (
+    github_login TEXT PRIMARY KEY,
+    entra_id TEXT,
+    email TEXT,
+    display_name TEXT,
+    promoted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 def sync_pim_owners():
-    # 1. Get members of Entra ID group github_pim_owners (includes email!)
+    # 1. Get members of Entra ID group github_pim_owners
     pim_members = get_entra_group_members(PIM_OWNERS_GROUP)
-    # pim_members contains: {github_username, email, display_name}
+    pim_logins = {m['github_username'] for m in pim_members}
 
-    # 2. Get current GitHub owners
-    current_owners = get_github_org_owners()
+    # 2. Get users WE have promoted (from local DB)
+    our_promoted = get_promoted_owners_from_db()
+    our_promoted_logins = {u['github_login'] for u in our_promoted}
 
-    # 3. Whitelist - never remove
-    whitelist = set(PIM_OWNERS_WHITELIST.split(','))
-
-    # 4. Target owner state = PIM members + whitelist
-    pim_github_logins = {m['github_username'] for m in pim_members}
-    target_owners = pim_github_logins | whitelist
-
-    # 5. Promote new owners (change role member → admin)
+    # 3. Promote: users in PIM but not yet promoted by us
     for member in pim_members:
         login = member['github_username']
-        if login not in current_owners and is_org_member(login):
+        if login not in our_promoted_logins and is_org_member(login):
             set_org_membership(login, role='admin')
+            save_to_db(login, member)  # Store for later demote
             notify_user(member['email'], 'promoted', member['display_name'])
 
-    # 6. Demote owners no longer in PIM (except whitelist)
-    for login in current_owners - pim_github_logins - whitelist:
-        set_org_membership(login, role='member')
-        # Reverse lookup: find Entra ID user by GitHub username (postalCode)
-        user_info = lookup_entra_user_by_github_login(login)
-        if user_info:
-            notify_user(user_info['email'], 'demoted', user_info['display_name'])
+    # 4. Demote: users WE promoted who are no longer in PIM
+    to_demote = [u for u in our_promoted if u['github_login'] not in pim_logins]
+
+    # Safety check: ensure we don't remove last owner
+    if to_demote:
+        current_owners = get_github_org_owners()
+        if len(current_owners) - len(to_demote) < 1:
+            raise SecurityError("Would leave org with 0 owners")
+
+    for user in to_demote:
+        set_org_membership(user['github_login'], role='member')
+        remove_from_db(user['github_login'])
+        notify_user(user['email'], 'demoted', user['display_name'])
 ```
+
+### Key Principle
+
+> **We only demote users that we promoted.**
+>
+> This means:
+> - Break-glass accounts are never touched (we didn't promote them)
+> - Service accounts are never touched (we didn't promote them)
+> - Manual owner assignments are never touched
+> - Whitelist config errors cannot cause accidental demotions
 
 ## GitHub API
 
@@ -127,7 +171,7 @@ PUT /orgs/{org}/memberships/{username}
 }
 ```
 
-To list organization owners:
+To list organization owners (used for minimum owner count check):
 
 ```
 GET /orgs/{org}/members?role=admin
@@ -155,52 +199,61 @@ select = ['id', 'displayName', 'postalCode', 'mail', 'userPrincipalName']
 
 User email will be available as `mail` or fallback to `userPrincipalName`.
 
-## Entra ID Reverse Lookup
+## State Storage (SQLite)
 
-For demotions, we need to find the user's email by their GitHub username. This requires a new method in `AzureADGroupMembers`:
+The sync process maintains a local SQLite database to track users it has promoted:
 
 ```python
-async def get_user_by_github_login(self, github_login: str):
-    """
-    Find Entra ID user by GitHub username (stored in postalCode).
+import sqlite3
 
-    :param github_login: GitHub username to search for
-    :return: User details dict or None
-    """
-    if not self.client:
-        await self.authenticate()
+def init_db(db_path: str):
+    conn = sqlite3.connect(db_path)
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS promoted_owners (
+            github_login TEXT PRIMARY KEY,
+            entra_id TEXT,
+            email TEXT,
+            display_name TEXT,
+            promoted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    conn.commit()
+    return conn
 
-    query_params = UsersRequestBuilder.UsersRequestBuilderGetQueryParameters(
-        filter=f"postalCode eq '{github_login}'",
-        select=['id', 'displayName', 'mail', 'userPrincipalName', 'postalCode'],
-        top=1,
-    )
-    request_configuration = UsersRequestBuilder.UsersRequestBuilderGetRequestConfiguration(
-        query_parameters=query_params,
-    )
-    request_configuration.headers.add("ConsistencyLevel", "eventual")
-    response = await self.client.users.get(request_configuration=request_configuration)
+def save_promoted_user(conn, github_login, entra_id, email, display_name):
+    conn.execute('''
+        INSERT OR REPLACE INTO promoted_owners
+        (github_login, entra_id, email, display_name, promoted_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+    ''', (github_login, entra_id, email, display_name))
+    conn.commit()
 
-    if response and response.value:
-        user = response.value[0]
-        return {
-            'id': user.id,
-            'display_name': user.display_name,
-            'email': user.mail or user.user_principal_name,
-            'github_username': user.postal_code,
-        }
-    return None
+def get_promoted_users(conn):
+    cursor = conn.execute('SELECT * FROM promoted_owners')
+    return [dict(zip(['github_login', 'entra_id', 'email', 'display_name', 'promoted_at'], row))
+            for row in cursor.fetchall()]
+
+def remove_promoted_user(conn, github_login):
+    conn.execute('DELETE FROM promoted_owners WHERE github_login = ?', (github_login,))
+    conn.commit()
 ```
 
-**Note**: This requires `User.Read.All` permission on the Entra ID app (should already be configured for the existing sync).
+### Recovery from DB Loss
 
-**SECURITY**: Input must be sanitized before use in OData filter:
+If the SQLite file is lost/corrupted:
+- **No automatic demotions occur** (we don't know who we promoted)
+- All currently promoted users remain owners until manually resolved
+- Alert is sent to admin
+- Admin must either:
+  1. Restore from backup
+  2. Manually recreate the DB from current PIM group members
+  3. Let users' PIM expire naturally (they stay owners until next promotion cycle re-adds them to DB)
 
 ```python
-def sanitize_odata_string(value: str) -> str:
-    """Escape special characters for OData filter."""
-    # Escape single quotes by doubling them
-    return value.replace("'", "''")
+def handle_db_error():
+    logging.critical("ALERT: PIM state database unavailable - no demotions will occur")
+    send_alert_email("PIM state database error - manual intervention required")
+    # Continue running but skip demote logic until DB is restored
 ```
 
 ## User Notification
@@ -235,7 +288,7 @@ If you need Owner access again, please activate it through Entra ID PIM.
 
 ## Deployment (Docker Compose)
 
-Add a new service for PIM sync:
+Add a new service for PIM sync with persistent volume for SQLite:
 
 ```yaml
 services:
@@ -251,7 +304,15 @@ services:
     env_file: .env
     command: python sync.py --mode pim-owners --continuous --interval 30
     restart: always
+    volumes:
+      - pim-data:/data  # Persistent storage for SQLite state
+
+volumes:
+  pim-data:
+    # Consider using named volume with backup strategy
 ```
+
+> **Important**: The SQLite database must be persisted. Loss of this file means we lose track of who we promoted, which disables demote functionality until resolved.
 
 ## Fail-safe Behavior
 
@@ -272,10 +333,16 @@ All user-controlled input (GitHub usernames) must be sanitized before use in:
 - Log messages (prevent log injection)
 
 ### 2. Minimum Owner Count
-**CRITICAL**: Never reduce owner count below 1. Before any demotion:
+**CRITICAL**: Never reduce owner count below 1. Before demoting, check GitHub:
 ```python
+# Get current owner count from GitHub
+current_owners = get_github_org_owners()  # GET /orgs/{org}/members?role=admin
+owners_to_demote = [u for u in our_promoted if u['github_login'] not in pim_logins]
+
 if len(current_owners) - len(owners_to_demote) < 1:
-    raise SecurityError("Cannot demote: would leave org with 0 owners")
+    logging.error("Cannot demote: would leave org with 0 owners")
+    send_alert_email("PIM sync blocked - would remove last owner")
+    return  # Skip demotions this cycle
 ```
 
 ### 3. Empty PIM Group Protection
@@ -334,67 +401,82 @@ healthcheck:
 | Risk | Impact | Mitigation |
 |------|--------|------------|
 | Break-glass account compromised | Attacker has permanent owner access | Audit log, credential rotation, monitor usage |
-| Entra ID API unavailable | Cannot verify PIM state | Fail-safe: don't remove owners on error |
+| Entra ID API unavailable | Cannot verify PIM state | Fail-safe: don't demote on error |
 | GitHub API unavailable | Changes don't apply | Retry logic, alerting |
 | Sync process crashes | Owners remain active longer | Health check, auto-restart (Docker) |
 | Email notification fails | User unaware of change | Log warning, don't block sync |
-| **OData injection via GitHub username** | Query manipulation | Sanitize input, escape special chars |
-| **Empty PIM group (API glitch)** | Mass demotion of all owners | Treat empty result as error, require explicit empty |
-| **Fail-safe exploitation** | Attacker causes errors to prevent demotion | Rate limit errors, alert on repeated failures |
+| **Empty PIM group (API glitch)** | Could demote all tracked users | Treat empty result as error |
+| **SQLite DB lost/corrupted** | Cannot demote anyone | Alert admin, manual intervention, backups |
 | **postalCode self-modification** | Privilege escalation | Verify Entra ID permissions, restrict postalCode write |
-| **No minimum owner count** | Org left without owners | Enforce minimum 1 owner always remains |
+
+### Risks Eliminated by Stateful Approach
+
+| Previous Risk | Why No Longer Applicable |
+|---------------|--------------------------|
+| Whitelist config typo | No whitelist needed - we only demote who we promoted |
+| OData injection (reverse lookup) | No reverse lookup needed - user data stored on promote |
+| Accidental break-glass demotion | Impossible - we never promoted them |
+| Mass owner demotion | Can only demote users in our DB |
 
 ## Test Scenarios
 
 ### Functional Tests
-1. [ ] User activates PIM → becomes owner within 30s
-2. [ ] User deactivates PIM → demoted to member within 30s
-3. [ ] Break-glass account remains owner even without PIM
-4. [ ] On Entra ID outage, no changes are made
-5. [ ] On GitHub API failure, retry logic kicks in
-6. [ ] User outside organization with active PIM is ignored
-7. [ ] User receives email on promotion
-8. [ ] User receives email on demotion (reverse lookup works)
-9. [ ] Email failure doesn't block the sync process
-10. [ ] Reverse lookup fails gracefully (demotion still happens, just no email)
+1. [ ] User activates PIM → becomes owner within 30s, recorded in DB
+2. [ ] User deactivates PIM → demoted to member within 30s, removed from DB
+3. [ ] Break-glass account remains owner (never in our DB)
+4. [ ] Manual owner assignment is not affected by sync
+5. [ ] On Entra ID outage, no changes are made
+6. [ ] On GitHub API failure, retry logic kicks in
+7. [ ] User outside organization with active PIM is ignored
+8. [ ] User receives email on promotion
+9. [ ] User receives email on demotion
+10. [ ] Email failure doesn't block the sync process
+
+### Stateful Logic Tests
+11. [ ] Promoted user is correctly stored in SQLite
+12. [ ] Demoted user is correctly removed from SQLite
+13. [ ] Restart preserves DB state (volume persistence)
+14. [ ] DB corruption triggers alert, no demotions occur
+15. [ ] DB recovery: manual re-seed from current PIM group works
 
 ### Security Tests
-11. [ ] GitHub username with special chars (`'`, `"`, `\`) doesn't break queries
-12. [ ] Empty PIM group triggers error, no demotions happen
-13. [ ] Cannot demote last owner (minimum 1 owner enforced)
-14. [ ] Audit log contains all required fields
-15. [ ] SIGTERM causes graceful shutdown after current cycle
-16. [ ] Health check file updated after each successful sync
+16. [ ] Empty PIM group triggers error, no demotions happen
+17. [ ] Users not in our DB are never demoted (implicit whitelist)
+18. [ ] Minimum owner count enforced (cannot demote last owner)
+19. [ ] Audit log contains all required fields
+20. [ ] SIGTERM causes graceful shutdown after current cycle
+21. [ ] Health check file updated after each successful sync
 
 ## Implementation Steps
 
 ### Phase 1: Core Implementation
 1. [ ] Approve this specification
 2. [ ] Add `mail`/`userPrincipalName` to Entra ID group member query
-3. [ ] Add `get_user_by_github_login()` method to `AzureADGroupMembers` (reverse lookup)
-4. [ ] Add `sanitize_odata_string()` helper function
-5. [ ] Add `list_owners()` method to `GitHubOrgManager`
-6. [ ] Add `set_member_role()` method to `GitHubOrgManager`
-7. [ ] Add `notify_user()` function for email notifications
+3. [ ] Add SQLite state management (init, save, get, remove)
+4. [ ] Add `list_owners()` method to `GitHubOrgManager` (for minimum owner check)
+5. [ ] Add `set_member_role()` method to `GitHubOrgManager`
+6. [ ] Add `notify_user()` function for email notifications
 
 ### Phase 2: CLI & Sync Logic
-8. [ ] Implement `--mode pim-owners` argument
-9. [ ] Implement `--continuous` mode with `--interval`
+7. [ ] Implement `--mode pim-owners` argument
+8. [ ] Implement `--continuous` mode with `--interval`
+9. [ ] Implement stateful promote/demote logic
 10. [ ] Add empty PIM group protection
 11. [ ] Add minimum owner count protection
-12. [ ] Add new environment variables
+12. [ ] Add DB error handling (fail-safe on DB unavailable)
+13. [ ] Add new environment variables
 
 ### Phase 3: Security & Operations
-13. [ ] Add structured audit logging for all owner changes
-14. [ ] Add SIGTERM handler for graceful shutdown
-15. [ ] Add health check file writing
-16. [ ] Update docker-compose.yml with healthcheck
+14. [ ] Add structured audit logging for all owner changes
+15. [ ] Add SIGTERM handler for graceful shutdown
+16. [ ] Add health check file writing
+17. [ ] Update docker-compose.yml with healthcheck and volume
 
 ### Phase 4: Testing & Documentation
-17. [ ] Test on staging organization (all functional tests)
-18. [ ] Run security tests (input sanitization, edge cases)
-19. [ ] Update README.md
-20. [ ] Security review sign-off
+18. [ ] Test on staging organization (all functional tests)
+19. [ ] Run security tests (DB loss scenario, edge cases)
+20. [ ] Update README.md
+21. [ ] Security review sign-off
 
 > **IMPORTANT - postalCode Security Note**
 >
