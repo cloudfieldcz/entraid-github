@@ -305,7 +305,7 @@ ALERT_EMAIL_RECIPIENT=your_alert_email_recipient # Email for sending alerts
 # Read-all team permissions (optional)
 READALL_TEAM=all                        # Team to grant read access (default: "all")
 READALL_IGNORE_REPOS=secret-repo        # Comma-separated list of repos to skip
-READALL_IGNORE_PREFIXES=aida-,internal- # Comma-separated prefixes to skip (case-insensitive)
+READALL_IGNORE_PREFIXES=secret-repo,another-private-repo # Comma-separated prefixes to skip (case-insensitive)
 ```
 
 **Note**: For the private key in environment variables, you can either:
