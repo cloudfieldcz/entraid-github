@@ -1019,13 +1019,17 @@ async def sync_pim_owners():
             db.close()
             return error_log
 
-        # Empty PIM group protection: treat as error, not "demote all"
+        # Empty PIM group protection
+        allow_empty = os.getenv('PIM_ALLOW_EMPTY_GROUP', 'false').lower() == 'true'
         if len(pim_members) == 0:
-            error_msg = 'PIM group returned 0 members - treating as API error'
-            logging.error(error_msg)
-            error_log.append(error_msg)
-            db.close()
-            return error_log
+            if allow_empty:
+                logging.info('PIM group returned 0 members - will demote all promoted users (PIM_ALLOW_EMPTY_GROUP=true)')
+            else:
+                error_msg = 'PIM group returned 0 members - treating as API error (set PIM_ALLOW_EMPTY_GROUP=true to allow)'
+                logging.error(error_msg)
+                error_log.append(error_msg)
+                db.close()
+                return error_log
 
         logging.info(f'PIM group has {len(pim_members)} members')
         pim_logins = {m['github_username'] for m in pim_members if m.get('github_username')}
@@ -1092,8 +1096,18 @@ async def sync_pim_owners():
                 db.close()
                 return error_log
 
+        # Get whitelist of users to never demote (extra safety)
+        whitelist_str = os.getenv('PIM_NEVER_DEMOTE', '')
+        whitelist = {u.strip() for u in whitelist_str.split(',') if u.strip()}
+
         for user in to_demote:
             login = user['github_login']
+
+            # Whitelist check: skip users in never-demote list
+            if login in whitelist:
+                logging.warning(f'Skipping demotion of {login} - in PIM_NEVER_DEMOTE whitelist')
+                continue
+
             try:
                 # Demote to member
                 gh.set_member_role(login, role='member')

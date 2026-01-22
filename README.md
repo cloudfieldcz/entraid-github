@@ -150,10 +150,17 @@ Unlike traditional whitelisting, PIM sync uses a **stateful approach**:
 ### Safety Mechanisms
 
 1. **Minimum Owner Count**: Never reduces owner count below 1
-2. **Empty PIM Group Protection**: Empty group is treated as error, not "demote all"
+2. **Empty PIM Group Protection**: By default, empty group is treated as error (configurable via `PIM_ALLOW_EMPTY_GROUP`)
 3. **Fail-Safe on Errors**: API errors prevent any demotions
 4. **Database Loss Protection**: If DB is lost, no demotions occur (alert sent)
 5. **Audit Logging**: All owner changes logged with timestamp, user, and trigger
+
+**Note on Empty Groups**: The stateful approach means break-glass accounts are always protected (they're never in our database). The empty group check protects against config errors and API issues. Set `PIM_ALLOW_EMPTY_GROUP=true` if you want to allow demoting all promoted users when the PIM group is legitimately empty.
+
+**Extra Safety: Never-Demote Whitelist**: Use `PIM_NEVER_DEMOTE` to specify GitHub usernames that should never be demoted, even if they're in the database. This provides defense-in-depth for critical accounts like break-glass administrators. Example:
+```bash
+PIM_NEVER_DEMOTE=break-glass-admin,emergency-owner,svc-github-admin
+```
 
 ### PIM Sync Commands
 
@@ -180,6 +187,8 @@ Add these environment variables to your `.env` file:
 PIM_OWNERS_GROUP=github_pim_owners              # Entra ID group for PIM owners
 PIM_STATE_FILE=/data/pim_state.db               # SQLite file for tracking promoted users
 PIM_NOTIFY_USERS=true                           # Send email to users on role change
+PIM_ALLOW_EMPTY_GROUP=false                     # Allow empty PIM group (will demote all promoted users)
+PIM_NEVER_DEMOTE=break-glass-admin,svc-account  # Comma-separated GitHub usernames to never demote
 ```
 
 ### Deployment with Docker Compose
