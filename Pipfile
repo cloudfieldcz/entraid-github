@@ -12,6 +12,7 @@ python-dotenv = "*"
 PyJWT = "*"
 cryptography = "*"
 tenacity = "*"
+httpcore = {extras = ["asyncio"], version = "*"}
 
 [dev-packages]
 pytest = "*"
