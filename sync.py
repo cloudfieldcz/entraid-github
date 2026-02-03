@@ -10,6 +10,7 @@ from msgraph.generated.groups.groups_request_builder import GroupsRequestBuilder
 from dotenv import load_dotenv
 import logging
 from pim_db import PIMStateDB
+from retry import async_retry_transient
 
 # log format with timestamp 
 LOGLEVEL = os.environ.get('LOGLEVEL', 'INFO').upper()
@@ -122,6 +123,7 @@ class AzureADGroupMembers:
         )
         self.client = GraphServiceClient(credential, scopes=['https://graph.microsoft.com/.default'])
 
+    @async_retry_transient
     async def list_group_members_by_id(self, group_id: str):
         """
         Lists all effective members of the specified Azure AD group.
@@ -169,6 +171,7 @@ class AzureADGroupMembers:
 
         return member_details
 
+    @async_retry_transient
     async def get_group_members(self, group_name: str):
         """
         Gets the members of an Azure AD group by name.
@@ -199,6 +202,7 @@ class AzureADGroupMembers:
             logging.debug(f"No group found with the name '{group_name}'")
             return None
 
+    @async_retry_transient
     async def list_groups(self, group_name_prefix:str):
         """
         Gets the groups in Azure AD that match the specified prefix.
